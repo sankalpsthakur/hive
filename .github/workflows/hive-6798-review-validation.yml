@@ -1,0 +1,206 @@
+name: Validate HIVE-30037 review correction
+on:
+  push:
+    branches: [validation/hive-6798-review-20260918]
+permissions:
+  contents: read
+jobs:
+  validate:
+    if: github.repository == 'sankalpsthakur/hive'
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    env:
+      MAVEN_OPTS: -Xmx3g
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 686e7ba3462995b295f49cef696d8fe203b67bf0
+          persist-credentials: false
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - name: Build the pinned source and test dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/hive-review-receipts
+          mvn -B -ntp -pl ql -am install -DskipTests > /tmp/hive-review-receipts/dependencies.log 2>&1 || { tail -100 /tmp/hive-review-receipts/dependencies.log; exit 1; }
+          tail -50 /tmp/hive-review-receipts/dependencies.log
+      - name: Add numeric GROUP BY regressions without changing implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('ql/src/test/org/apache/hadoop/hive/ql/parse/TestSemanticAnalyzer.java')
+          s = p.read_text()
+          marker = '  private void assertOrderByOrdinalResolvedOnCboDecline(String query) throws Exception {'
+          assert s.count(marker) == 1
+          added = '''  @Test
+            public void testCboDeclinePreservesOutOfRangeGroupByConstant() throws Exception {
+              assertGroupByConstantSurvivesCboDecline("100");
+            }
+
+            @Test
+            public void testCboDeclinePreservesInRangeGroupByConstant() throws Exception {
+              assertGroupByConstantSurvivesCboDecline("2");
+            }
+
+            private void assertGroupByConstantSurvivesCboDecline(String constant) throws Exception {
+              boolean original = conf.getBoolVar(HiveConf.ConfVars.HIVE_GROUPBY_POSITION_ALIAS);
+              conf.setBoolVar(HiveConf.ConfVars.HIVE_GROUPBY_POSITION_ALIAS, true);
+              try {
+                AnalyzedQuery analyzed = analyzeQueryWithCbo("select " + constant
+                    + " as k, count(*) as n from table1 tablesample (2 rows) group by 1 order by 1");
+                assertTrue(analyzed.analyzer.getCboInfo(),
+                    analyzed.analyzer.getCboInfo() != null
+                        && analyzed.analyzer.getCboInfo().contains("not optimized by CBO"));
+                ASTNode groupBy = findFirstNodeOfType(analyzed.ast, HiveParser.TOK_GROUPBY);
+                assertNotNull(groupBy);
+                assertEquals(HiveParser.Number, ((ASTNode) groupBy.getChild(0)).getType());
+                assertEquals(constant, groupBy.getChild(0).getText());
+                ASTNode orderByRef = findFirstOrderByRef(analyzed.ast);
+                assertNotNull(orderByRef);
+                assertEquals(HiveParser.Number, orderByRef.getType());
+                assertEquals(constant, orderByRef.getText());
+              } finally {
+                conf.setBoolVar(HiveConf.ConfVars.HIVE_GROUPBY_POSITION_ALIAS, original);
+              }
+            }
+
+            private static ASTNode findFirstNodeOfType(ASTNode node, int type) {
+              if (node.getType() == type) {
+                return node;
+              }
+              for (int i = 0; i < node.getChildCount(); i++) {
+                ASTNode found = findFirstNodeOfType((ASTNode) node.getChild(i), type);
+                if (found != null) {
+                  return found;
+                }
+              }
+              return null;
+            }
+
+          '''
+          s = s.replace(marker, added + marker)
+          p.write_text(s)
+          PY
+          git diff --check
+      - name: Reproduce the second-pass regression on the unchanged PR
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e
+          mvn -B -ntp -pl ql test '-Dtest=TestSemanticAnalyzer#testCboDeclinePreservesOutOfRangeGroupByConstant+testCboDeclinePreservesInRangeGroupByConstant' > /tmp/hive-review-receipts/before.log 2>&1
+          result=$?
+          set -e
+          tail -100 /tmp/hive-review-receipts/before.log
+          test "$result" -ne 0
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as E
+          files = list(Path('ql/target').rglob('TEST-org.apache.hadoop.hive.ql.parse.TestSemanticAnalyzer.xml'))
+          assert len(files) == 1, files
+          root = E.parse(files[0]).getroot()
+          print(root.attrib)
+          assert int(root.get('tests')) == 2
+          assert int(root.get('skipped', '0')) == 0
+          assert int(root.get('failures', '0')) + int(root.get('errors', '0')) == 2
+          cases = {c.get('name'): c for c in root.findall('testcase')}
+          out_of_range = E.tostring(cases['testCboDeclinePreservesOutOfRangeGroupByConstant'], encoding='unicode')
+          assert 'Position alias: 100 does not exist' in out_of_range, out_of_range
+          in_range = E.tostring(cases['testCboDeclinePreservesInRangeGroupByConstant'], encoding='unicode')
+          assert 'UDAF' in in_range or 'count' in in_range, in_range
+          Path('/tmp/hive-review-receipts/before.xml').write_bytes(files[0].read_bytes())
+          PY
+      - name: Restrict CBO-decline substitution to ORDER BY
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java')
+          s = p.read_text()
+          before = 'processPositionAlias(ast, !HiveConf.getBoolVar(conf, HiveConf.ConfVars.HIVE_CBO_ENABLED));'
+          assert s.count(before) == 1
+          s = s.replace(before, 'processPositionAlias(ast, true, !HiveConf.getBoolVar(conf, HiveConf.ConfVars.HIVE_CBO_ENABLED));')
+          before = '  void processPositionAlias(ASTNode ast, boolean processOrderByPositionAlias) throws SemanticException {'
+          assert s.count(before) == 1
+          s = s.replace(before, '  void processPositionAlias(ASTNode ast, boolean processGroupByPositionAlias,\n      boolean processOrderByPositionAlias) throws SemanticException {')
+          method_start = s.index('  void processPositionAlias(ASTNode ast, boolean processGroupByPositionAlias,')
+          prefix, method = s[:method_start], s[method_start:]
+          assert '        if (groupbyNode != null) {' in method
+          method = method.replace('        if (groupbyNode != null) {', '        if (processGroupByPositionAlias && groupbyNode != null) {', 1)
+          s = prefix + method
+          s = s.replace('    // processOrderByPositionAlias=true so the legacy planner does not compile the ordinal\n    // as a constant sort key (HIVE-30037).', '    // only ORDER BY enabled; GROUP BY expressions have already been resolved and\n    // must not be interpreted as ordinals a second time (HIVE-30037).')
+          p.write_text(s)
+          p = Path('ql/src/java/org/apache/hadoop/hive/ql/parse/CalcitePlanner.java')
+          s = p.read_text()
+          assert s.count('        processPositionAlias(ast, true);') == 1
+          s = s.replace('        processPositionAlias(ast, true);', '        processPositionAlias(ast, false, true);')
+          p.write_text(s)
+          PY
+          git diff --check
+          git add ql/src/java/org/apache/hadoop/hive/ql/parse/CalcitePlanner.java ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java ql/src/test/org/apache/hadoop/hive/ql/parse/TestSemanticAnalyzer.java
+          git diff --cached --binary > /tmp/hive-review-receipts/fix.patch
+          git diff --cached --stat
+      - name: Run the full affected analyzer class twice
+        shell: bash
+        run: |
+          set -euo pipefail
+          for n in 1 2; do
+            mvn -B -ntp -pl ql test -Dtest=TestSemanticAnalyzer > /tmp/hive-review-receipts/after-$n.log 2>&1 || { tail -100 /tmp/hive-review-receipts/after-$n.log; exit 1; }
+            TEST_REPEAT="$n" python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import xml.etree.ElementTree as E
+          files = list(Path('ql/target').rglob('TEST-org.apache.hadoop.hive.ql.parse.TestSemanticAnalyzer.xml'))
+          assert len(files) == 1, files
+          root = E.parse(files[0]).getroot()
+          print(root.attrib)
+          assert int(root.get('tests')) >= 27
+          assert all(int(root.get(k, '0')) == 0 for k in ('failures', 'errors', 'skipped'))
+          Path('/tmp/hive-review-receipts/after-' + os.environ['TEST_REPEAT'] + '.xml').write_bytes(files[0].read_bytes())
+          PY
+          done
+          git diff --check
+          git diff --exit-code
+          git write-tree > /tmp/hive-review-receipts/tree.txt
+          git rev-parse HEAD > /tmp/hive-review-receipts/parent.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hive-6798-review-receipts
+          path: /tmp/hive-review-receipts
+          retention-days: 14
+  candidate:
+    needs: validate
+    if: github.repository == 'sankalpsthakur/hive'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 686e7ba3462995b295f49cef696d8fe203b67bf0
+      - uses: actions/download-artifact@v4
+        with:
+          name: hive-6798-review-receipts
+          path: /tmp/hive-review-receipts
+      - name: Publish tested source-only candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$(cat /tmp/hive-review-receipts/parent.txt)"
+          git apply --index /tmp/hive-review-receipts/fix.patch
+          test "$(git write-tree)" = "$(cat /tmp/hive-review-receipts/tree.txt)"
+          test "$(git diff --cached --name-only | wc -l)" -eq 3
+          ! git diff --cached --name-only | grep '^.github/'
+          git diff --cached --check
+          git config user.name 'Sankalp Thakur'
+          git config user.email '31366524+sankalpsthakur@users.noreply.github.com'
+          git commit -m 'HIVE-30037: Preserve resolved GROUP BY expressions on CBO decline' -m 'Generated-by: ChatGPT GPT-6 Astra Pro'
+          git push origin HEAD:refs/heads/review/hive-6798-tested-20260918
+          git rev-parse HEAD >> "$GITHUB_STEP_SUMMARY"
