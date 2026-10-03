@@ -1,0 +1,101 @@
+name: Hive 6798 exact-head validation
+on:
+  push:
+    branches: [validation/hive-6798-20261003]
+    paths: [.github/workflows/hive-6798-validation.yml]
+permissions:
+  contents: read
+jobs:
+  regression:
+    if: github.repository == 'sankalpsthakur/hive'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      TARGET_SHA: 9522cd4e982c98770101349ee5cf1e30a760d111
+      MAVEN_OPTS: -Xmx3072m
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out immutable PR source without stored credentials
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          git init src
+          git -C src remote add origin https://github.com/sankalpsthakur/hive.git
+          git -C src fetch --depth=1 origin "$TARGET_SHA"
+          git -C src checkout --detach FETCH_HEAD
+          test "$(git -C src rev-parse HEAD)" = "$TARGET_SHA"
+          printf '%s\n' "$TARGET_SHA" > evidence/tested-head.txt
+          test -n "${JAVA_HOME_21_X64:-}"
+          echo "JAVA_HOME=$JAVA_HOME_21_X64" >> "$GITHUB_ENV"
+          echo "$JAVA_HOME_21_X64/bin" >> "$GITHUB_PATH"
+          git -C src diff --check
+      - name: Build reactor dependencies (not a test result)
+        working-directory: src
+        run: |
+          set -euo pipefail
+          java -version 2>&1 | tee ../evidence/java-version.txt
+          mvn -version | tee ../evidence/maven-version.txt
+          mvn -B -ntp -pl ql -am -DskipTests install 2>&1 | tee ../evidence/reactor-build.log
+      - name: Execute AST and Tez row-order regressions
+        working-directory: src
+        run: |
+          set -euo pipefail
+          mvn -B -ntp -pl ql -DskipTests=false -Dmaven.test.skip=false \
+            -Dtest=TestSemanticAnalyzer,TestOrderByOrdinalCboDeclineRows test \
+            2>&1 | tee ../evidence/regression-tests.log
+      - name: Require individual regressions to execute without skips
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          required = {
+              'TestSemanticAnalyzer': {
+                  'testOrderByOrdinalResolvedWhenCboDeclinesTablesample',
+                  'testOrderByOrdinalResolvedWhenCboDeclinesSortByLimitSubquery',
+                  'testOrderByOrdinalStillSortedWhenCboHandlesStatement',
+                  'testCboDeclinePreservesOutOfRangeGroupByConstant',
+                  'testCboDeclinePreservesInRangeGroupByConstant',
+              },
+              'TestOrderByOrdinalCboDeclineRows': {
+                  'testTablesampleOrderByOrdinalDescReturns321',
+              },
+          }
+          results, missing = [], []
+          for cls, names in required.items():
+              paths = list(Path('src/ql/target/surefire-reports').glob(f'TEST-*.{cls}.xml'))
+              if len(paths) != 1:
+                  missing.append(f'{cls}: expected one XML report, found {len(paths)}')
+                  continue
+              root = ET.parse(paths[0]).getroot()
+              cases = {c.attrib['name']: c for c in root.iter('testcase')}
+              for name in sorted(names):
+                  case = cases.get(name)
+                  ok = case is not None and not any(case.find(tag) is not None for tag in ('failure', 'error', 'skipped'))
+                  results.append({'class': cls, 'method': name, 'passed': ok})
+                  if not ok:
+                      missing.append(f'{cls}.{name}: absent, failed, errored or skipped')
+              for key in ('failures', 'errors', 'skipped'):
+                  if int(root.get(key, '0')):
+                      missing.append(f'{cls}: {key}={root.get(key)}')
+          record = {'tested_head': os.environ['TARGET_SHA'], 'cases': results, 'problems': missing}
+          Path('evidence').mkdir(exist_ok=True)
+          Path('evidence/individual-regressions.json').write_text(json.dumps(record, indent=2) + '\n')
+          print(json.dumps(record, indent=2))
+          if missing:
+              raise SystemExit(1)
+          PY
+      - name: Retain logs and actual test reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: hive-6798-exact-head-evidence
+          path: |
+            evidence/
+            src/ql/target/surefire-reports/
+          retention-days: 14
+          if-no-files-found: error
