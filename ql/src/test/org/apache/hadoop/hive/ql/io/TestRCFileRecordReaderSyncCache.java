@@ -115,8 +115,9 @@ public class TestRCFileRecordReaderSyncCache {
     assertEquals(secondRows, fromWholeFile);
 
     // Read the non-leading split first so a stale cache hit is used before this
-    // generation can replace the path+splitAt entry.
-    int fromSecondSplit = countRows(
+    // generation can replace the path+splitAt entry. A stale seek may either
+    // stop early (EOF is swallowed in RCFile.Reader) or throw a parse error.
+    int fromSecondSplit = countRowsLenient(
         new FileSplit(file, splitAt, secondLen - splitAt, new String[0]));
     int fromFirstSplit = countRows(new FileSplit(file, 0, splitAt, new String[0]));
     assertEquals("overwrite must not silently drop rows via a stale sync-cache offset",
@@ -166,6 +167,30 @@ public class TestRCFileRecordReaderSyncCache {
     try {
       while (reader.next(key, value)) {
         rows++;
+      }
+    } finally {
+      reader.close();
+    }
+    return rows;
+  }
+
+  /**
+   * Like {@link #countRows(FileSplit)} but treats a mid-split IOException as a
+   * truncated read (the stale-cache failure mode besides swallowed EOF).
+   */
+  private int countRowsLenient(FileSplit split) throws IOException {
+    RCFileRecordReader<LongWritable, BytesRefArrayWritable> reader =
+        new RCFileRecordReader<LongWritable, BytesRefArrayWritable>(conf, split);
+    LongWritable key = reader.createKey();
+    BytesRefArrayWritable value = reader.createValue();
+    int rows = 0;
+    try {
+      try {
+        while (reader.next(key, value)) {
+          rows++;
+        }
+      } catch (IOException e) {
+        return rows;
       }
     } finally {
       reader.close();

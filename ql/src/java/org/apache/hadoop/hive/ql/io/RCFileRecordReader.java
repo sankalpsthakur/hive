@@ -25,6 +25,7 @@ import java.util.Map;
 import java.util.WeakHashMap;
 
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hive.conf.HiveConf;
@@ -52,6 +53,8 @@ public class RCFileRecordReader<K extends LongWritable, V extends BytesRefArrayW
   protected Configuration conf;
   private final FileSplit split;
   private final boolean useCache;
+  private final long fileLength;
+  private final long fileModificationTime;
 
   private static RCFileSyncCache syncCache = new RCFileSyncCache();
 
@@ -68,10 +71,21 @@ public class RCFileRecordReader<K extends LongWritable, V extends BytesRefArrayW
       cache = Collections.synchronizedMap(new WeakHashMap<String, RCFileSyncEntry>());
     }
 
-    public void put(FileSplit split, long endSync) {
+    /**
+     * Cache key must include file generation (length + mtime). Path+offset alone
+     * is reused after INSERT OVERWRITE of the same path (HIVE-30192).
+     */
+    private static String makeKey(Path path, long offset, long fileLength,
+        long fileModificationTime) {
+      return path.toString() + "+" + offset + "+" + fileLength + "+"
+          + fileModificationTime;
+    }
+
+    public void put(FileSplit split, long endSync, long fileLength,
+        long fileModificationTime) {
       Path path = split.getPath();
       long end = split.getStart() + split.getLength();
-      String key = path.toString()+"+"+String.format("%d",end);
+      String key = makeKey(path, end, fileLength, fileModificationTime);
 
       RCFileSyncEntry entry = new RCFileSyncEntry();
       entry.end = end;
@@ -81,10 +95,10 @@ public class RCFileRecordReader<K extends LongWritable, V extends BytesRefArrayW
       }
     }
 
-    public long get(FileSplit split) {
+    public long get(FileSplit split, long fileLength, long fileModificationTime) {
       Path path = split.getPath();
       long start = split.getStart();
-      String key = path.toString()+"+"+String.format("%d",start);
+      String key = makeKey(path, start, fileLength, fileModificationTime);
       RCFileSyncEntry entry = cache.get(key);
       if(entry != null) {
         return entry.endSync;
@@ -98,6 +112,9 @@ public class RCFileRecordReader<K extends LongWritable, V extends BytesRefArrayW
 
     Path path = split.getPath();
     FileSystem fs = path.getFileSystem(conf);
+    FileStatus fileStatus = fs.getFileStatus(path);
+    this.fileLength = fileStatus.getLen();
+    this.fileModificationTime = fileStatus.getModificationTime();
     this.in = new RCFile.Reader(fs, path, conf);
     this.end = split.getStart() + split.getLength();
     this.conf = conf;
@@ -106,8 +123,8 @@ public class RCFileRecordReader<K extends LongWritable, V extends BytesRefArrayW
     useCache = HiveConf.getBoolVar(conf, HiveConf.ConfVars.HIVE_USE_RCFILE_SYNC_CACHE);
 
     if (split.getStart() > in.getPosition()) {
-      long oldSync = useCache ? syncCache.get(split) : -1;
-      if(oldSync == -1) {
+      long oldSync = useCache ? syncCache.get(split, fileLength, fileModificationTime) : -1;
+      if(oldSync < 0 || oldSync >= fileLength) {
         in.sync(split.getStart()); // sync to start
       } else {
         in.seek(oldSync);
@@ -163,7 +180,7 @@ public class RCFileRecordReader<K extends LongWritable, V extends BytesRefArrayW
 
     if (lastSeenSyncPos >= end) {
       if(useCache) {
-        syncCache.put(split, lastSeenSyncPos);
+        syncCache.put(split, lastSeenSyncPos, fileLength, fileModificationTime);
       }
       more = false;
       return more;
