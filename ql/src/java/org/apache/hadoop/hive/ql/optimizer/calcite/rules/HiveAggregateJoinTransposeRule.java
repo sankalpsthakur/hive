@@ -308,6 +308,11 @@ public class HiveAggregateJoinTransposeRule extends AggregateJoinTransposeRule {
             newAggCalls);
       }
 
+      // topSplit types DECIMAL SUM using Hive COMPLETE inference (precision
+      // + 10). Cast back so this rule preserves the original row type
+      // (HIVE-30154).
+      relBuilder.convert(aggregate.getRowType(), false);
+
       RelNode r = relBuilder.build();
       boolean transform = false;
       if (uniqueBased && aggConvertedToProjects) {

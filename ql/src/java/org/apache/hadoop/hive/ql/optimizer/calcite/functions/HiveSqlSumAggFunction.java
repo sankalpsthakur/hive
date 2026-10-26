@@ -49,7 +49,6 @@ import com.google.common.collect.ImmutableList;
  * is the same type.
  */
 public class HiveSqlSumAggFunction extends SqlAggFunction {
-  final SqlReturnTypeInference returnTypeInference;
   final SqlOperandTypeInference operandTypeInference;
   final SqlOperandTypeChecker operandTypeChecker;
 
@@ -64,7 +63,6 @@ public class HiveSqlSumAggFunction extends SqlAggFunction {
         operandTypeInference,
         operandTypeChecker,
         SqlFunctionCategory.NUMERIC);
-    this.returnTypeInference = returnTypeInference;
     this.operandTypeChecker = operandTypeChecker;
     this.operandTypeInference = operandTypeInference;
   }
@@ -116,7 +114,16 @@ public class HiveSqlSumAggFunction extends SqlAggFunction {
         throw new AssertionError("unexpected count " + merges);
       }
       int ordinal = extra.register(node);
-      return AggregateCall.create(new HiveSqlSumAggFunction(returnTypeInference,
+      // Hive COMPLETE/PARTIAL1 SUM widens DECIMAL precision by 10
+      // (HiveTypeSystemImpl.deriveSumType). RelBuilder re-infers this
+      // AggregateCall from the SqlAggFunction with type=null, so freeze
+      // the Hive physical type here. The transpose rule casts the result
+      // back to aggregateCall.type so the overall row type is preserved.
+      RelDataTypeFactory typeFactory = rexBuilder.getTypeFactory();
+      RelDataType hiveSumType = typeFactory.createTypeWithNullability(
+          typeFactory.getTypeSystem().deriveSumType(typeFactory, node.getType()),
+          aggregateCall.type.isNullable());
+      return AggregateCall.create(new HiveSqlSumAggFunction(ReturnTypes.explicit(hiveSumType),
               operandTypeInference,
               operandTypeChecker),
           false,
@@ -127,7 +134,7 @@ public class HiveSqlSumAggFunction extends SqlAggFunction {
           -1,
           aggregateCall.distinctKeys,
           aggregateCall.collation,
-          aggregateCall.type,
+          hiveSumType,
           aggregateCall.name);
     }
   }
